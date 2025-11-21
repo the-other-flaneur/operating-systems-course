@@ -23,7 +23,7 @@ This repository contains all my laboratory projects from the Operating Systems c
 
 ---
 
-### [Lab 2](./lab2/) - Semaphores Implementation in XV&
+### [Lab 2](./lab2/) - Semaphores Implementation in XV6
 **Completed:** October 2024  
 **Topics Covered:**
 - System call implementation in kernel space
