@@ -1,0 +1,136 @@
+
+### Primera Parte: Estudiando el planificador de xv6-riscv
+
+1. ¿Qué política de planificación utiliza `xv6-riscv` para elegir el próximo proceso a ejecutarse?
+
+`xv6-riscv` utiliza round robin. 
+El scheduler recorre la tabla de procesos buscando un proceso en estado runnable (p->state == RUNNABLE). Cuando lo encuentra asigna c->proc, y p->state = RUNNING, y luego llama a swtch para empezar a ejecutarlo.
+
+
+```c
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        // Switch to the chosen process.  It is the process's job
+        // to release its lock and then reacquire it
+        // before jumping back to us.
+        p->state = RUNNING;
+        c->proc = p;
+        swtch(&c->context, &p->context);
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+      }
+      release(&p->lock);
+    }
+```
+
+2. ¿Cuáles son los estados en los que un proceso puede permanecer en xv6-riscv y qué los hace cambiar de estado?
+
+Un proceso puede estar en uno y solo uno de los estados siguientes:
+
+```c
+enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+```
+Además varias situaciones que hacen cambiar de estado a los procesos, como;
+- Inicialización de un proceso, con fork() por ejemplo. (UNUSED -> RUNNABLE).
+- El scheduler selecciona un proceso para ejecutar. (RUNNABLE -> RUNNING).
+- Una interrupción del timer. (RUNNING -> RUNNABLE).
+- Una llamada a sistema, como sleep() (RUNNING -> SLEEPING), exit() (RUNNING -> ZOMBIE) y sched() (RUNNING -> RUNNABLE).
+- Una operación de I/O, pipes, usando wait(). (RUNNING -> SLEEPING).
+- Termina un evento de los anteriores, wakeup(). (SLEEPING -> RUNNABLE).
+- Un proceso intenta adquirir un lock en uso. (RUNNING -> SLEEPING).
+- Se llama a freeproc() para liberar la memoria del proceso (USED -> UNUSED).
+
+3. ¿Qué es un *quantum*? ¿Dónde se define en el código? ¿Cuánto dura un *quantum* en `xv6-riscv`?
+Pista: Se puede empezar a buscar desde la system call `uptime` o leyendo la documentación de xv6 en la sección de interrupciones.
+
+La política Round Robin ejecuta un proceso por un periodo de tiempo llamado a veces scheduling quantum. Y un quantum debe ser múltiplo del periodo del timer-interrupt.
+
+En `xv6-riscv`, se implementa a través del mecanismo de interrupciones y el valor exacto puede variar pero es generalmente 1000000 ciclos de clock (1 ms en algunos sistemas). 
+
+```c
+ int interval = 1000000; // cycles; about 1/10th second in qemu.
+```
+kernel/start.c, línea 69.
+
+4. ¿En qué parte del código ocurre el cambio de contexto en `xv6-riscv`? ¿En qué funciones un proceso deja de ser ejecutado? ¿En qué funciones se elige el nuevo proceso a ejecutar?
+
+El cambio de contexto se origina en las funciones scheduler y sched. En el archivo kernel/proc.c en la línea 463,
+
+```c
+    swtch(&c->context, &p->context);
+```
+y en la línea 497,
+
+```c
+    swtch(&p->context, &mycpu()->context);
+```
+
+la llamada a swtch ejecuta el código en swtch.S
+
+```c
+    void swtch(struct context *old, struct context *new);
+```
+
+Luego un proceso deja de ser ejecutado cuando:
+- El proceso voluntariamente entrega el cpu llamando a sleep o yield. Luego de una señal de exit/kill de un proceso (llama a yield) o una llamada a wait (llama a sleep) de un proceso esperando algún dispositivo. 
+- Ocurre un interrupt, donde usertrap y kerneltrap llaman a yield.
+
+Y un nuevo proceso a ejecutar se elige en la función scheduler.
+			
+5. ¿El cambio de contexto consume tiempo de un *quantum*?
+
+El cambio de contexto en la política Round Robin si consume tiempo de un quantum, de hecho se consume del quantum del siguiente proceso.
+Como ejemplo el planteado en el libro de la cátedra en la parte de amortización.
+
+> For example, if the time slice is set to 10 ms, and the context-switch cost
+> is 1 ms, roughly 10% of time is spent context switching and is thus wasted.
+> 
+> capítulo Scheduling, página 8, TIP: AMORTIZATION CAN REDUCE COSTS.
+
+### Segunda Parte: Medir operaciones de cómputo y de entrada/salida
+
+#### Experimento 1: ¿Cómo son planificados los programas iobound y cpubound?
+
+Responder las siguientes preguntas utilizando gráficos y/o tablas para justificar sus respuestas:
+
+1. Describa los parámetros de los programas cpubench e iobench para este experimento (o sea, los define al principio y el valor de N. Tener en cuenta que podrían cambiar en experimentos futuros, pero que si lo hacen los resultados ya no serán comparables).
+
+2. ¿Los procesos se ejecutan en paralelo? ¿En promedio, qué proceso o procesos se ejecutan primero? Hacer una observación cualitativa.
+
+3. ¿Cambia el rendimiento de los procesos iobound con respecto a la cantidad y tipo de procesos que se estén ejecutando en paralelo? ¿Por qué?
+
+4. ¿Cambia el rendimiento de los procesos cpubound con respecto a la cantidad y tipo de procesos que se estén ejecutando en paralelo? ¿Por qué?
+
+5. ¿Es adecuado comparar la cantidad de operaciones de cpu con la cantidad de operaciones iobound?
+
+#### Experimento 2: ¿Qué sucede cuando cambiamos el largo del quantum?
+
+Luego responder:
+
+1. ¿Fue necesario modificar las métricas para que los resultados fueran comparables? ¿Por qué?
+
+2. ¿Qué cambios se observan con respecto al experimento anterior? ¿Qué comportamientos se mantienen iguales?
+
+3. ¿Con un quatum más pequeño, se ven beneficiados los procesos iobound o los procesos cpubound?
+
+### Tercera Parte: Asignar prioridad a los procesos
+
+1.  Agregue un campo en `struct proc` que guarde la prioridad del proceso (entre `0` y `NPRIO-1` para `#define NPRIO 3` niveles en total siendo `0` el prioridad minima y el `NPRIO-1` prioridad máxima) y manténgala actualizada según el comportamiento del proceso, además agregue el campo en `struct proc` que guarde la cantidad de veces que fue elegido ese proceso por el planificador para ejecutarse y se mantenga actualizado:
+    - MLFQ regla 3: Cuando un proceso se inicia, su prioridad será máxima.
+    - MLFQ regla 4: Descender de prioridad cada vez que el proceso pasa todo un quantum realizando cómputo. Ascender de prioridad cada vez que el proceso se bloquea antes de terminar su quantum. Nota: Este comportamiento es distinto al del MLFQ del libro.
+
+2. Para comprobar que estos cambios se hicieron correctamente, modifique la función `procdump` (que se invoca con `CTRL-P`) para que imprima la prioridad de los procesos. Así, al correr nuevamente `iobench` y `cpubench`, debería darse que luego de un tiempo que los procesos `cpubench` tengan baja prioridad mientras que los `iobench` tengan alta prioridad.
+
+### Cuarta Parte: Implementar MLFQ
+
+
+1. Modifique el planificador de manera que seleccione el próximo proceso a planificar siguiendo las siguientes reglas:
+    - MLFQ regla 1: Si el proceso A tiene mayor prioridad que el proceso B, corre A. (y no B)
+    - MLFQ regla 2: Si dos procesos A y B tienen la misma prioridad, corre el que menos veces fue elegido por el  planificador.
+
+2. Repita las mediciones de la segunda parte para ver las propiedades del nuevo planificador.
+
+3. Para análisis responda: ¿Se puede producir starvation en el nuevo planificador? Justifique su respuesta.
