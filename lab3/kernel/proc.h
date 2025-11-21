@@ -81,6 +81,9 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Being 0 the minimum priority and 3 the maximum priority by Lab 3 req.
+#define NPRIO 3 
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -104,4 +107,10 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // Multi-Level-Feedback-Queue 
+  uint entry_time;             // Entry time in the current queue.
+  uint queue_ticks[NPRIO];     // Number of ticks done in each queue.
+  uint current_queue;          // Current queue number of the process.
+  uint no_of_times_scheduled;  // Number of times the process been scheduled.
 };

@@ -124,6 +124,12 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->current_queue = NPRIO - 1; // MLFQ regla 3
+  p->entry_time = ticks;
+  for(int i = 0; i < NPRIO; i++) {
+    p->queue_ticks[i] = 0;
+  }
+  p->no_of_times_scheduled = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +175,12 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->current_queue = NPRIO - 1; // MLFQ regla 3
+  p->entry_time = ticks;
+  for(int i = 0; i < NPRIO; i++) {
+    p->queue_ticks[i] = 0;
+  }
+  p->no_of_times_scheduled = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -452,21 +464,65 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    struct proc *chosenProc = 0;
+    // `NPRIO-1` maximum priority by lab 3 requirements.
+    int highest_queue = NPRIO - 1; 
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+    // No priority boost.
+
+    // Iterate process table to find the RUNNABLE process. 
+    // with the highest priority and lowest number of times scheduled.
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+
+      if (p->state == RUNNABLE) {
+
+        // Case 1: First RUNNABLE process founded.
+        if (chosenProc == 0) { 
+          chosenProc = p;
+          highest_queue = chosenProc->current_queue;
+        }
+
+        // Case 2: MLFQ Regla 1.
+        // Current process has higher priority than the chosen process.
+        else if (p->current_queue > highest_queue) {
+          chosenProc = p;
+          highest_queue = chosenProc->current_queue;
+        }
+
+        // Case 3: MLFQ Regla 2.
+        // Current process has the same priority as the chosen process.
+        // Chose by the number of times scheduled.
+        else if (p->current_queue == highest_queue && 
+          p->no_of_times_scheduled < chosenProc->no_of_times_scheduled) {
+          chosenProc = p; 
+        }
+
       }
       release(&p->lock);
+    }
+
+    // Schedule the process.
+    if (chosenProc != 0) {
+      acquire(&chosenProc->lock);
+      if (chosenProc->state == RUNNABLE) {
+        // Increment the number of times the process has been scheduled.
+        chosenProc->no_of_times_scheduled++; 
+        // Update the entry time of the process.
+        chosenProc->entry_time = ticks;      
+
+        // Switch state and execute the process.
+        chosenProc->state = RUNNING;
+        c->proc = chosenProc;
+        swtch(&c->context, &chosenProc->context);
+
+        // Process is done running (either by quantum, sleep or exit).
+        c->proc = 0;
+        // Update the number of ticks done in the current queue.
+        int elapsed_ticks = ticks - chosenProc->entry_time;
+        chosenProc->queue_ticks[chosenProc->current_queue] += elapsed_ticks; 
+      }
+      release(&chosenProc->lock);
     }
   }
 }
@@ -505,6 +561,15 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+
+  // MLFQ regla 4.
+  // Decrease priority if process has spent whole quantum.
+  // Timer interrupt calls yield from user/kernel trap.
+  if (p->current_queue > 0) {
+    p->current_queue--; 
+  };
+  // Add time spent on this current_queue
+  p->queue_ticks[p->current_queue] += (ticks - p->entry_time); 
   sched();
   release(&p->lock);
 }
@@ -550,7 +615,14 @@ sleep(void *chan, struct spinlock *lk)
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
-
+  
+  // MLFQ regla 4.
+  // Increase priority if process goes to sleep before consuming whole quantum.
+  if (p->current_queue < NPRIO - 1) {
+    p->current_queue++; 
+  };
+  // Add to time spent on current_queue.
+  p->queue_ticks[p->current_queue] += (ticks - p->entry_time); 
   sched();
 
   // Tidy up.
@@ -663,21 +735,48 @@ procdump(void)
   [USED]      "used",
   [SLEEPING]  "sleep ",
   [RUNNABLE]  "runble",
-  [RUNNING]   "run   ",
+  [RUNNING]   "running",
   [ZOMBIE]    "zombie"
   };
+
+  // 0 being the minimum priority and NPRIO-1 the maximum priority by Lab 3 req.
+  static char *prios[] = {
+  [0] "Low",
+  [1] "Medium",
+  [2] "High"
+  };
+
   struct proc *p;
   char *state;
+  char *prio;
+  int pid;
+  char name[16];
+
 
   printf("\n");
   for(p = proc; p < &proc[NPROC]; p++){
-    if(p->state == UNUSED)
+		acquire(&p->lock);
+    if(p->state == UNUSED) { 
+      release(&p->lock);
       continue;
-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+    }
+
+    if(p->state >= 0 && p->state < NELEM(states) && states[p->state]){
       state = states[p->state];
-    else
-      state = "???";
-    printf("%d %s %s", p->pid, state, p->name);
-    printf("\n");
+    } else {
+			state = "???";
+		}
+
+    if (p->current_queue >= 0 && p->current_queue < NPRIO 
+                                                && prios[p->current_queue]) {
+      prio = prios[p->current_queue];
+    } else {
+			prio = "???";
+		}
+
+    pid = p->pid;
+    safestrcpy(name, p->name, sizeof(p->name));
+		release(&p->lock);
+    printf("[%d]\t %s \t %s \t %s \n", pid, state, name, prio);
   }
 }
